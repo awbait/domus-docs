@@ -1,0 +1,82 @@
+---
+title: "Пайплайн"
+---
+
+# Архитектура — Голосовой пайплайн
+
+> Обновлять при: добавлении новых шагов пайплайна (IntentRouter, Speaker Recognition), изменении логики сессий.
+
+---
+
+## Пайплайн
+
+```
+Микрофон
+    │ PCM 16kHz/16bit, чанки 100мс
+    ▼
+[Wake Word]        ──── постоянный gRPC stream, модель domovoy.onnx
+    │ DetectionEvent{word, confidence}
+    │ onset: 3 кадра подряд > 0.5, cooldown: 30 чанков
+    ▼
+Beep (880 Гц)      ──── сигнал пользователю
+    │
+    ▼
+[Запись команды]   ──── RecordUntilSilence (~1.5с тишина)
+    │ []byte (PCM)
+    ▼
+[STT]              ──── gRPC Transcribe, GigaAM, таймаут 15с
+    │ string (текст)
+    │
+    ▼  ← ЗДЕСЬ будет IntentRouter (P1: стоп-слова, затем HA)
+    │
+    ▼
+[LLM]              ──── gRPC Chat, tool calling loop (до 5 итераций)
+    │ string (ответ)
+    ▼
+[TTS]              ──── gRPC Synthesize, Silero xenia, таймаут 5с
+    │ []byte (WAV)
+    ▼
+[Playback]         ──── malgo воспроизведение + barge-in детекция
+    │
+    └──► следующий turn (conversation mode, без wake word)
+         или возврат в ожидание wake word
+```
+
+## Состояние сессии
+
+```go
+type Session struct {
+    ID   string    // random 4-byte hex
+    Turn int       // инкремент после каждого ответа LLM
+}
+```
+
+Сессия создаётся при обнаружении wake word. `ClearHistory()` при новой сессии — LLM-контекст сбрасывается.
+
+**Планируется (P1):** `SessionState` с явной стейт-машиной, кешем последнего WAV-ответа, таймерами для контекстной памяти.
+
+## Barge-in (прерывание)
+
+Параллельно с воспроизведением TTS — детекция wake word. При срабатывании:
+1. Отменяется `context` воспроизведения → playback останавливается
+2. Пропускается ожидание wake word (`skipWakeWord`)
+3. Сразу запись следующей команды
+
+## Latency budget
+
+| Этап | Цель | Максимум |
+|------|------|---------|
+| Wake word detection | 50мс | 100мс |
+| Запись команды | 2000мс | 3000мс |
+| STT (GigaAM) | 5000мс | 8000мс |
+| LLM (qwen2.5:3b) | 2000мс | 5000мс |
+| TTS (Silero xenia) | 300мс | 1000мс |
+| **Итого** | **~9.5с** | **~17с** |
+
+## Ключевые файлы
+
+- `internal/app/orchestrator.go` — пайплайн, интерфейсы
+- `internal/app/readiness.go` — `WaitForServices()` перед запуском
+- `internal/app/dialog_logger.go` — JSONL лог + сессии
+- `internal/wakeword/client.go` — async gRPC stream (буфер 100 слотов)
+- `internal/audio/capture.go` — malgo + `RecordUntilSilence`

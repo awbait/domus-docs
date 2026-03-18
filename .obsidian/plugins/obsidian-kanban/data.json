@@ -1,0 +1,12 @@
+{
+  "show-checkboxes": true,
+  "move-dates": true,
+  "tag-colors": [
+    {
+      "tagKey": "#tier1",
+      "color": "rgba(212, 191, 0, 1)",
+      "backgroundColor": "rgba(233, 247, 39, 0.1)"
+    }
+  ],
+  "lane-width": 350
+}
