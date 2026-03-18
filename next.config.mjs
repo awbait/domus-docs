@@ -5,6 +5,7 @@ const withMDX = createMDX();
 /** @type {import('next').NextConfig} */
 const config = {
   output: 'export',
+  basePath: '/domus-docs',
   images: { unoptimized: true },
   serverExternalPackages: ['@takumi-rs/image-response'],
   reactStrictMode: true,
