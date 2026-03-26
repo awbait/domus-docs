@@ -301,6 +301,44 @@ my-module.zip
 
 ---
 
+## Realtime-обновление виджетов (WebSocket)
+
+Ядро предоставляет WebSocket Hub. Модули используют его для обновления виджетов в реальном времени — без polling.
+
+### Бэкенд → фронтенд
+
+Builtin:
+
+```go
+// Доза отмечена → обновить виджет у всех пользователей
+s.core.BroadcastWS(ctx, "pill-tracker.dose.updated", payload)
+
+// Или конкретному пользователю
+s.core.SendWS(ctx, userID, "pill-tracker.dose.updated", payload)
+```
+
+Dynamic:
+
+```
+POST /internal/ws/broadcast
+{"event": "my-module.data.updated", "payload": {...}}
+
+POST /internal/ws/send
+{"user_id": "...", "event": "my-module.data.updated", "payload": {...}}
+```
+
+### Фронтенд — подписка
+
+```tsx
+useWSEvent("pill-tracker.dose.updated", (data) => {
+  refetch() // перезапросить данные
+})
+```
+
+Конвенция имён: `{module-id}.{entity}.{action}` (`pill-tracker.dose.updated`, `clock.tick`).
+
+---
+
 ## Push-уведомления
 
 Модули отправляют push-уведомления через Core Services API. Модуль сам решает когда и кому слать.
@@ -308,7 +346,6 @@ my-module.zip
 ### Builtin
 
 ```go
-// CoreServices передаётся модулю при создании
 s.core.SendPush(ctx, userID, "Таблетница", "Барсику пора давать Рибоксин")
 ```
 
