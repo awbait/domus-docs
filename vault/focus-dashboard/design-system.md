@@ -392,11 +392,13 @@ src/modules/{name}/
 └── index.ts          — экспорт
 ```
 
-Регистрация в `src/core/widgets.tsx`:
+Регистрация в `src/core/widgets.tsx` (метаданные приходят из API):
 ```tsx
-const WIDGET_REGISTRY = {
-  'clock': { component: ClockWidget, name: 'Часы' },
-  'pill-tracker': { component: PillWidget, name: 'Pill Tracker' },
+const BUILTIN_COMPONENTS: Record<string, ComponentType> = {
+  clock: ClockWidget,
+  'pill-tracker': PillTrackerWidget,
+  'clock.clock': ClockWidget,
+  'pill-tracker.today': PillTrackerWidget,
 }
 ```
 
