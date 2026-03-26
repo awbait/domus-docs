@@ -690,18 +690,24 @@ customElements.define('my-module-widget', MyWidget)
 
 ### Widget Registry
 
-Статический реестр builtin-виджетов в `frontend/src/core/widgets.tsx`:
+Маппинг builtin widget ID -> React-компонент в `frontend/src/core/widgets.tsx`. Метаданные (размеры, список виджетов) приходят из API, не хардкодятся:
 
 ```tsx
-export const WIDGET_REGISTRY: Record<string, WidgetRegistryEntry> = {
-  clock: { moduleId: 'clock', label: ..., icon: ..., defaultW: 2, defaultH: 2 },
-  'pill-tracker': { moduleId: 'pill-tracker', ... },
+// Маппинг ID -> компонент (поддерживает legacy и compound ID)
+const BUILTIN_COMPONENTS: Record<string, ComponentType> = {
+  clock: ClockWidget,
+  'pill-tracker': PillTrackerWidget,
+  'clock.clock': ClockWidget,
+  'pill-tracker.today': PillTrackerWidget,
 }
+
+// Список доступных виджетов строится из GET /api/modules
+getAvailableWidgets(modules: ModuleInfo[]): AvailableWidget[]
 ```
 
 `renderWidget(widgetId, modules)` выбирает рендеринг:
-1. Dynamic-модуль -> `<DynamicWidget moduleId={moduleId} widgetId={widgetId} />`
-2. Builtin -> React-компонент по widget ID
+1. Builtin -> React-компонент из `BUILTIN_COMPONENTS`
+2. Dynamic-модуль -> `<DynamicWidget moduleId={moduleId} widgetId={widgetId} />`
 3. Неизвестный -> placeholder
 
 Для dynamic-модулей один `widget.js` регистрирует несколько Web Components (`<pill-tracker-today>`, `<pill-tracker-history>`).
