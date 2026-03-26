@@ -8,7 +8,7 @@ icon: MiLayoutDashboard
 ## Ideas
 
 - [ ] pill-tracker: push-уведомления (VAPID) #module #p1
-	VAPID-ключи, хранение подписок браузеров (таблица `push_subscriptions` и env заготовлены, логика не написана). Отправка: за 5 мин до дозы, +30 мин если не отмечена. Endpoint `POST /api/modules/pill-tracker/push/subscribe`.
+	Перенесено в Фазу 3 модульной системы. [[module-system-analysis#Фаза 3 — Push-уведомления]]
 - [ ] Модуль: Управление Домовым (domovoy-control) #module #p2
 	Backend: proxy к HTTP API Домового (текстовые команды, история, hub/spoke статус). Frontend: виджет 2x2 + полноэкранный режим с логом команд и статусом нод. Зависит от наличия HTTP API в Домовом.
 - [ ] Модуль: Погода #module #backlog
@@ -41,14 +41,35 @@ icon: MiLayoutDashboard
 
 ## Planned
 
+### Модульная система — эволюция
+
+Спецификация: [[module-system]] | Анализ: [[module-system-analysis]]
+
+- [ ] Фаза 0: CoreServices interface #arch #p1
+	Интерфейс `core.Services` (SendPush, BroadcastWS, SendWS, Publish, Subscribe) + stub-реализация (no-op). Передать в модули через конструктор: `pilltracker.New(db, core)`. Фундамент для фаз 2–4. Файлы: `internal/core/services.go`, `modules/*/module.go`, `cmd/dashboard/main.go`.
+- [ ] Фаза 1: Множественные виджеты + метаданные #arch #p1
+	Один модуль → несколько виджетов. `WidgetMeta{ID, Min, Max, Default}`, `EventMeta` в Describe(). Парсинг `widgets`/`events` из manifest.json. Фронтенд: заменить хардкод `WIDGET_REGISTRY` на данные из `GET /api/modules`, составные ID (`pill-tracker.today`), React.lazy(). Файлы: `internal/module/module.go`, `loader.go`, `dynmodule/store.go`, `frontend/src/core/widgets.tsx`, `BoardPage.tsx`, `DynamicWidget.tsx`.
+- [ ] Фаза 2: WebSocket broadcast для модулей #arch #p1
+	Подключить существующий WS Hub к CoreServices (BroadcastWS/SendWS). HTTP endpoints `POST /internal/ws/broadcast`, `/internal/ws/send` (localhost-only) для dynamic. Frontend: хук `useWSEvent()`. Файлы: `internal/core/services.go`, `internal/server/server.go`, `frontend/src/hooks/useWSEvent.ts`.
+- [ ] Фаза 3: Push-уведомления #arch #p2
+	Реализовать `internal/core/push/` (VAPID, Web Push API, таблица `push_subscriptions`). HTTP endpoints: `POST /api/push/subscribe`, `POST /internal/push`. Service Worker + подписка на фронтенде. pill-tracker: cron проверка пропущенных доз → `core.SendPush()`. Файлы: `internal/core/push/`, `frontend/public/sw.js`, `frontend/src/lib/push.ts`, `modules/pill-tracker/service.go`.
+- [ ] Фаза 4: Event Bus #arch #p2
+	In-memory pub/sub с pattern matching (`pill-tracker.dose.*`). HTTP endpoints для dynamic: `POST /internal/events/publish`, `/internal/events/subscribe` + webhook delivery. pill-tracker публикует события при give/skip/missed. Файлы: `internal/core/events/`, `modules/pill-tracker/service.go`.
+- [ ] Фаза 5: Widget Bridge SDK #arch #p2
+	JS-библиотека `focus-widget-sdk` для dynamic-виджетов: `Focus.ready()`, `Focus.api()`, `Focus.getSettings()`, `Focus.on()`, `Focus.getWidgetId()`. Инжектировать через DynamicWidget. Файлы: `frontend/src/lib/focus-widget-sdk.ts`, `frontend/src/components/DynamicWidget.tsx`.
+- [ ] Фаза 6: Widget Preview + i18n dynamic #arch #p3
+	`preview.png` в модулях, endpoint `GET /api/modules/{id}/preview.png`, Widget Picker показывает превью. Dynamic i18n: `locales/*.json` в ZIP, регистрация через `addResourceBundle()`. Файлы: `internal/core/dynmodule/handler.go`, `store.go`, `DynamicWidget.tsx`.
+- [ ] Шаблонный модуль example-counter #arch #p3
+	Минимальный fullstack dynamic-модуль (Go backend + Web Component) в `focus-modules/` как образец. После Фаз 1 + 5.
+
+### Другое
+
 - [ ] Кастомизация: фоновое изображение #ui #backlog
 	Фоновое изображение для board (URL или загрузка файла). Нужно: поле `background_image` в модели board, endpoint upload, CSS background в BoardPage. Акцентный цвет уже реализован (oklch hue picker).
 - [ ] Self-service PIN #auth
 	Авторизированный пользователь может сам установить/сменить PIN из ProfilePage. Сейчас PIN задаёт только admin (UsersPanel). Нужно: `PUT /api/profile/pin` endpoint + форма в ProfilePage.
 - [ ] Статистика ресурсов модулей #arch #backlog
 	Метрики CPU/memory per module. Сейчас `HealthAll()` возвращает только pass/fail. Нужно: расширить health endpoint метриками, UI в AdminPage > Modules.
-- [ ] i18n в сторонних модулях #arch #backlog
-	Передавать текущий locale как атрибут в DynamicWidget при монтировании custom element. Сейчас `React.createElement` не передаёт locale.
 
 
 ## In Progress
