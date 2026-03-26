@@ -3,6 +3,7 @@
 
 # generated content
 .source
+/content/docs/
 
 # test & build
 /coverage
@@ -26,5 +27,4 @@ yarn-error.log*
 next-env.d.ts
 
 # Obsidian
-.obsidian/workspace.json
-.obsidian/workspace-mobile.json
+vault/.obsidian/

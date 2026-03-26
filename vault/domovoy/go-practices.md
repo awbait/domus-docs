@@ -1,0 +1,772 @@
+# Go Practices — Домовой
+
+---
+
+## 1. Архитектура: слои и ответственность
+
+Каждое изменение в коде обусловлено одной из трёх причин: смена транспорта, изменение бизнес-логики или смена хранилища. Три слоя:
+
+| Слой | Ответственность | Пример изменения |
+|------|----------------|------------------|
+| **Handler** (транспорт) | Приём запросов, формирование ответов (gRPC, HTTP) | Переход с HTTP на gRPC — меняется только Handler |
+| **Service** (бизнес-логика) | Координация задач, вызов репозиториев и других сервисов | Новое бизнес-правило — меняется только Service |
+| **Repository** (хранение) | Абстракция над БД, файлами, внешними API | Переход с in-memory на SQLite — меняется только Repository |
+
+**Применение к Домовому:**
+
+```
+internal/
+  app/
+    orchestrator.go      # Service — координация пайплайна
+    readiness.go         # Service — проверка готовности
+  intent/
+    router.go            # Service — маршрутизация интентов
+    parser.go            # Service — парсинг команд
+  grpc/
+    stt_client.go        # Handler (gRPC клиент) — транспорт к STT
+    tts_client.go        # Handler (gRPC клиент) — транспорт к TTS
+    wakeword_client.go   # Handler (gRPC клиент) — транспорт к VAD
+    llm_client.go        # Handler (gRPC клиент) — транспорт к LLM
+  audio/
+    capture.go           # Repository (аппаратный ресурс) — микрофон
+    playback.go          # Repository (аппаратный ресурс) — динамик
+  dialog/
+    logger.go            # Repository — запись диалогов в файл
+  homeassistant/
+    client.go            # Repository (внешний API) — HA REST API
+    adapter.go           # ACL — перевод HA-сущностей в доменные модели
+  config/
+    config.go            # Инфраструктура — загрузка конфигурации
+```
+
+---
+
+## 2. Изоляция слоёв через интерфейсы
+
+**Принцип:** интерфейс объявляется там, где потребляется, а не там, где реализуется.
+
+```go
+// internal/app/orchestrator.go — потребитель определяет что ему нужно
+type transcriber interface {
+    Transcribe(ctx context.Context, audio []byte) (string, error)
+}
+
+type synthesizer interface {
+    Synthesize(ctx context.Context, text string) ([]byte, error)
+}
+
+type Orchestrator struct {
+    stt transcriber  // легко подменить в тестах
+    tts synthesizer
+}
+```
+
+```go
+// internal/grpc/stt_client.go — провайдер возвращает структуру
+func NewSTTClient(addr string, timeout time.Duration) (*STTClient, error) { ... }
+```
+
+**Правило:** принимай интерфейсы, возвращай структуры.
+
+---
+
+## 3. Модели данных на каждом слое
+
+Детали реализации одного слоя не должны протекать в другой.
+
+| Слой | Тип модели | Назначение |
+|------|-----------|------------|
+| Handler | **DTO** | Теги `json`, `protobuf` — сериализация для транспорта |
+| Service | **Domain Model** | Бизнес-правила и методы, без транспортных тегов |
+| Repository | **Record/Entity** | Структура хранилища (БД-теги, файловые форматы) |
+
+```go
+// Handler (DTO) — gRPC proto-сгенерированная структура
+// gen/proto/stt/stt.pb.go
+type TranscribeResponse struct {
+    Text string `protobuf:"bytes,1,opt,name=text"`
+}
+
+// Service (Domain) — чистая модель без тегов транспорта
+// internal/intent/intent.go
+type Intent struct {
+    Action   string // "turn_on", "turn_off", "stop"
+    Domain   string // "light", "climate", "system"
+    Area     string // "bedroom", "kitchen"
+    EntityID string
+}
+
+// Repository (Record) — модель хранилища
+// internal/dialog/record.go
+type DialogRecord struct {
+    Timestamp time.Time `json:"ts"`
+    UserText  string    `json:"user"`
+    Response  string    `json:"resp"`
+    Latency   int64     `json:"lat_ms"`
+}
+```
+
+---
+
+## 4. DDD — когда и как применять
+
+**Правило:** усложняй по боли. Не внедряй DDD пока текущая структура не мешает.
+
+### Value Objects — для типобезопасности
+
+```go
+// internal/intent/action.go
+type Action string
+
+const (
+    ActionTurnOn  Action = "turn_on"
+    ActionTurnOff Action = "turn_off"
+    ActionGetState Action = "get_state"
+    ActionStop    Action = "stop"
+)
+
+func ParseAction(s string) (Action, error) {
+    switch s {
+    case "turn_on", "turn_off", "get_state", "stop":
+        return Action(s), nil
+    default:
+        return "", fmt.Errorf("unknown action: %q", s)
+    }
+}
+```
+
+### Aggregates — логика рядом с данными
+
+```go
+// internal/app/session.go
+type Session struct {
+    state     SessionState
+    lastIntent time.Time
+    history   []DialogTurn
+}
+
+// Бизнес-правило внутри агрегата, а не размазано по сервису
+func (s *Session) CanUseContext() bool {
+    return s.state == StateActive && time.Since(s.lastIntent) < 20*time.Second
+}
+
+func (s *Session) HandleStopWord() {
+    s.state = StateIdle
+    s.history = nil
+}
+```
+
+---
+
+## 5. Валидация: структурная vs бизнесовая
+
+| Где | Что проверяем | Пример |
+|-----|--------------|--------|
+| **Handler** | Формат, обязательные поля, типы | Аудио не пустое, формат PCM |
+| **Service/Domain** | Бизнес-правила, состояния, совместимость | Сессия активна, интент распознан |
+
+```go
+// Handler — структурная валидация
+func (c *STTClient) Transcribe(ctx context.Context, audio []byte) (string, error) {
+    if len(audio) == 0 {
+        return "", fmt.Errorf("stt: empty audio")
+    }
+    // ...
+}
+
+// Service — бизнесовая валидация
+func (o *Orchestrator) processCommand(ctx context.Context, text string) error {
+    intent, err := o.intentRouter.Route(text)
+    if errors.Is(err, intent.ErrUnrecognized) {
+        return o.fallbackToLLM(ctx, text) // бизнес-решение
+    }
+    // ...
+}
+```
+
+---
+
+## 6. Anti-Corruption Layer (ACL)
+
+При интеграции с внешними системами — прослойка-адаптер переводит чужие модели в доменные.
+
+```go
+// internal/homeassistant/adapter.go
+type Adapter struct {
+    client *Client
+}
+
+// Переводит HA-сущность в доменную модель
+func (a *Adapter) GetDevice(ctx context.Context, entityID string) (domain.Device, error) {
+    haEntity, err := a.client.GetState(ctx, entityID)
+    if err != nil {
+        return domain.Device{}, fmt.Errorf("ha get state %s: %w", entityID, err)
+    }
+    // HA возвращает "on"/"off" строкой — конвертируем в домен
+    return domain.Device{
+        ID:    entityID,
+        Name:  haEntity.Attributes.FriendlyName,
+        On:    haEntity.State == "on",
+        Area:  haEntity.Attributes.Area,
+    }, nil
+}
+```
+
+---
+
+## 7. CQRS — чтение отдельно от записи
+
+Для чтения (дашборд, статус) — обходим бизнес-логику, читаем облегчённые модели напрямую.
+
+```go
+// Web Dashboard — лёгкий read-path, не через полный агрегат
+type DeviceStatus struct {
+    EntityID string `json:"entity_id"`
+    Name     string `json:"name"`
+    State    string `json:"state"`
+}
+
+func (r *HARepository) ListDeviceStatuses(ctx context.Context) ([]DeviceStatus, error) {
+    // прямой вызов HA API, без бизнес-логики
+}
+```
+
+---
+
+## 8. Инструменты качества кода
+
+### gofmt / goimports
+
+```go
+import (
+    "context"                         // стандартная библиотека
+    "fmt"
+
+    "google.golang.org/grpc"          // внешние пакеты
+
+    "domovoy/internal/config"         // внутренние пакеты
+)
+```
+
+### golangci-lint
+
+```yaml
+# .golangci.yml
+linters:
+  enable:
+    - errcheck       # игнорируемые ошибки
+    - govet          # подозрительные конструкции
+    - staticcheck    # продвинутый анализ
+    - revive         # стиль и читаемость
+    - gosec          # уязвимости безопасности
+    - gochecknoinits # запрет init()
+    - unparam        # неиспользуемые параметры
+
+linters-settings:
+  revive:
+    rules:
+      - name: exported
+      - name: error-return
+```
+
+---
+
+## 9. Структура пакетов
+
+### Всё в `internal/`
+
+Пакеты в `internal/` нельзя импортировать из других модулей — жёсткое ограничение компилятора. Домовой — не библиотека.
+
+### Нельзя `utils/`
+
+`utils` — антипаттерн, мусорный ящик. Каждая функция живёт в своём пакете по смыслу:
+
+```go
+// ПЛОХО: utils/utils.go
+func AudioToWAV(pcm []byte) []byte { ... }
+
+// ХОРОШО: internal/audio/convert.go
+func ToWAV(pcm []byte, sampleRate int) []byte { ... }
+```
+
+---
+
+## 10. Обработка ошибок
+
+### Оборачивание через `%w`
+
+```go
+func (c *STTClient) Transcribe(ctx context.Context, audio []byte) (string, error) {
+    resp, err := c.client.Transcribe(ctx, &pb.TranscribeRequest{Audio: audio})
+    if err != nil {
+        return "", fmt.Errorf("stt client transcribe: %w", err)
+    }
+    return resp.Text, nil
+}
+// Результат: "pipeline: stt client transcribe: connection refused"
+```
+
+### Проверка типа ошибки
+
+```go
+if errors.Is(err, context.DeadlineExceeded) {
+    slog.WarnContext(ctx, "stt timeout, retrying")
+}
+
+var grpcErr interface{ GRPCStatus() *status.Status }
+if errors.As(err, &grpcErr) {
+    code := grpcErr.GRPCStatus().Code()
+}
+```
+
+### Sentinel errors — только для публичного API пакета
+
+```go
+// internal/intent/errors.go
+var (
+    ErrUnrecognized = errors.New("intent: command not recognized")
+    ErrAmbiguous    = errors.New("intent: command is ambiguous")
+)
+```
+
+---
+
+## 11. Конкурентность
+
+### errgroup для пайплайна
+
+```go
+func (o *Orchestrator) Run(ctx context.Context) error {
+    g, ctx := errgroup.WithContext(ctx)
+
+    g.Go(func() error { return o.wakeWordLoop(ctx) })
+    g.Go(func() error { return o.commandLoop(ctx) })
+
+    return g.Wait() // ошибка в любой горутине → ctx отменяется
+}
+```
+
+### Каналы — передача данных, Mutex — защита состояния
+
+```go
+// Каналы
+type Orchestrator struct {
+    commands chan AudioCommand // wake word → command processor
+}
+
+// Mutex
+type SessionCache struct {
+    mu       sync.RWMutex
+    sessions map[string]*Session
+}
+```
+
+### sync.Pool для аудио-буферов
+
+```go
+var audioChunkPool = sync.Pool{
+    New: func() any {
+        buf := make([]byte, 3200) // 100мс при 16kHz/16bit
+        return &buf
+    },
+}
+```
+
+---
+
+## 12. gRPC клиенты
+
+```go
+type STTClient struct {
+    client  pb.STTClient
+    timeout time.Duration
+}
+
+func NewSTTClient(addr string, timeout time.Duration) (*STTClient, error) {
+    conn, err := grpc.NewClient(addr,
+        grpc.WithTransportCredentials(insecure.NewCredentials()),
+        grpc.WithDefaultServiceConfig(retryPolicy),
+    )
+    if err != nil {
+        return nil, fmt.Errorf("grpc dial stt %s: %w", addr, err)
+    }
+    return &STTClient{client: pb.NewSTTClient(conn), timeout: timeout}, nil
+}
+
+const retryPolicy = `{
+    "methodConfig": [{
+        "name": [{"service": "domovoy.stt.STT"}],
+        "retryPolicy": {
+            "maxAttempts": 3,
+            "initialBackoff": "0.5s",
+            "maxBackoff": "5s",
+            "backoffMultiplier": 2,
+            "retryableStatusCodes": ["UNAVAILABLE"]
+        }
+    }]
+}`
+```
+
+---
+
+## 13. Конфигурация
+
+Только env vars — 12-factor app.
+
+```go
+type Config struct {
+    STTAddr    string        `env:"STT_ADDR" envDefault:"stt:50051"`
+    TTSAddr    string        `env:"TTS_ADDR" envDefault:"tts:50052"`
+    STTTimeout time.Duration `env:"STT_TIMEOUT" envDefault:"15s"`
+    HAToken    string        `env:"HA_TOKEN" required:"true"`
+    LogLevel   string        `env:"LOG_LEVEL" envDefault:"info"`
+}
+```
+
+Fail fast при плохом конфиге — `os.Exit(1)` в `main()`.
+
+---
+
+## 14. Безопасность
+
+### mTLS между hub и spoke
+
+mTLS используется для **hub ↔ spoke** соединений (разные устройства по Wi-Fi). Локальные контейнеры на одном хосте защищены через Docker network isolation.
+
+mTLS даёт:
+- Шифрование трафика между устройствами
+- Идентификацию spoke по CN сертификата
+- Канал для OTA-обновлений (spoke не нужен интернет)
+- Отзыв доступа конкретного spoke без влияния на остальные
+
+```
+Spoke (комната) ──mTLS──→ Hub (Orange Pi)
+                            │
+                            ├── gRPC: STT, TTS, LLM
+                            ├── /api/update/check    → версия + хеш
+                            ├── /api/update/download → подписанный образ
+                            └── /api/health          ← spoke heartbeat
+```
+
+```go
+// internal/security/tls.go
+func LoadClientCreds(caFile, certFile, keyFile string) (credentials.TransportCredentials, error) {
+    cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+    if err != nil {
+        return nil, fmt.Errorf("load client cert: %w", err)
+    }
+
+    caCert, err := os.ReadFile(caFile)
+    if err != nil {
+        return nil, fmt.Errorf("read ca cert: %w", err)
+    }
+
+    pool := x509.NewCertPool()
+    pool.AppendCertsFromPEM(caCert)
+
+    return credentials.NewTLS(&tls.Config{
+        Certificates: []tls.Certificate{cert},
+        RootCAs:      pool,
+        MinVersion:   tls.VersionTLS13,
+    }), nil
+}
+
+// Использование в клиенте
+creds, err := security.LoadClientCreds(cfg.CAFile, cfg.CertFile, cfg.KeyFile)
+conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(creds))
+```
+
+**Правила:**
+- TLS 1.3 минимум, без fallback на старые версии
+- CA + серты хранятся в Docker volume, не в образе
+- Срок: серты 90 дней, CA — 1 год
+- Ротация: OTA updater проверяет срок сертов раз в сутки, перегенерирует если осталось <14 дней, перезапускает затронутые сервисы
+
+### Spoke — безопасность устройства
+
+Spoke — минимальный клиент в другой комнате. Не имеет доступа в интернет, обновляется только через hub.
+
+**Минимальный образ:**
+- Только: аудио capture, gRPC клиент, mTLS. Нет Python, нет пакетного менеджера, нет компилятора
+- Read-only rootfs (`overlayfs`), запись только в tmpfs
+- LUKS для раздела с ключами/сертификатами
+
+**Обновления через hub:**
+- Spoke запрашивает у hub'а текущую версию (`/api/update/check`)
+- Hub отдаёт подписанный образ (`/api/update/download`)
+- Spoke верифицирует подпись, применяет, перезагружается
+- Hub знает актуальную версию каждого spoke (heartbeat)
+
+**Мониторинг:**
+- Heartbeat каждые 30с — spoke не ответил 3 раза → алерт
+- Spoke отчитывается: версия прошивки, uptime, аудио-статус
+- Аномалии трафика — spoke шлёт в 10x больше данных → WARN
+
+### Секреты — никогда в env vars для продакшена
+
+```go
+// Dev: env vars (для удобства)
+// Prod: Docker secrets монтируются как файлы
+
+type Config struct {
+    // Dev — из env
+    HAToken string `env:"HA_TOKEN"`
+
+    // Prod — из файла (приоритет выше)
+    HATokenFile string `env:"HA_TOKEN_FILE"` // /run/secrets/ha_token
+}
+
+func (c *Config) GetHAToken() (string, error) {
+    if c.HATokenFile != "" {
+        data, err := os.ReadFile(c.HATokenFile)
+        if err != nil {
+            return "", fmt.Errorf("read secret %s: %w", c.HATokenFile, err)
+        }
+        return strings.TrimSpace(string(data)), nil
+    }
+    if c.HAToken == "" {
+        return "", fmt.Errorf("HA_TOKEN or HA_TOKEN_FILE required")
+    }
+    return c.HAToken, nil
+}
+```
+
+### Шифрование логов диалогов
+
+`dialog.jsonl` содержит plaintext всех разговоров — шифруем AES-256-GCM.
+
+```go
+// internal/dialog/crypto.go
+type EncryptedWriter struct {
+    key []byte // 32 байта, из Docker Secret
+    w   io.Writer
+}
+
+func (e *EncryptedWriter) WriteRecord(record []byte) error {
+    block, _ := aes.NewCipher(e.key)
+    gcm, _ := cipher.NewGCM(block)
+
+    nonce := make([]byte, gcm.NonceSize())
+    io.ReadFull(rand.Reader, nonce)
+
+    encrypted := gcm.Seal(nonce, nonce, record, nil)
+    // записываем: [4 байта длины][encrypted]
+    // ...
+}
+```
+
+**Правила:**
+- Ключ шифрования — отдельный Docker Secret, не тот же что HA_TOKEN
+- Nonce генерируется `crypto/rand`, никогда не `math/rand`
+- Логи шифруются record-by-record (не весь файл) — для append-only записи
+
+### Сетевая изоляция Docker
+
+```yaml
+# docker-compose.yml
+services:
+  stt:
+    expose: ["50051"]        # НЕ ports — не светим наружу
+    networks: [ml_internal]
+
+  domovoy:
+    networks: [ml_internal, external]
+
+networks:
+  ml_internal:
+    internal: true           # нет доступа в интернет
+  external:
+```
+
+**Правила:**
+- ML-сервисы (STT, TTS, VAD, LLM) — только `expose`, только `ml_internal`
+- Доступ в интернет — только Go-хаб (для HA API, OTA)
+- Ollama — `bind: 127.0.0.1`, доступ только через LLM gRPC proxy
+
+### Rate limiting
+
+Защита hub-spoke от злоупотреблений — `golang.org/x/time/rate`.
+
+```go
+// internal/security/ratelimit.go
+type RateLimiter struct {
+    limiters sync.Map // spokeID → *rate.Limiter
+    rps      float64
+    burst    int
+}
+
+func (rl *RateLimiter) Allow(spokeID string) bool {
+    v, _ := rl.limiters.LoadOrStore(spokeID, rate.NewLimiter(rate.Limit(rl.rps), rl.burst))
+    return v.(*rate.Limiter).Allow()
+}
+
+// gRPC interceptor
+func RateLimitInterceptor(rl *RateLimiter) grpc.UnaryServerInterceptor {
+    return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+        spokeID := getSpokeID(ctx) // из mTLS сертификата
+        if !rl.Allow(spokeID) {
+            return nil, status.Error(codes.ResourceExhausted, "rate limit exceeded")
+        }
+        return handler(ctx, req)
+    }
+}
+```
+
+**Правила:**
+- Spoke ID извлекается из mTLS-сертификата (CN), не из заголовков
+- Дефолт: 10 req/s, burst 20 — настраивается через env
+- Логировать превышения как WARN с spokeID
+
+### Запрещено
+
+| Паттерн | Риск | Вместо этого |
+|---------|------|-------------|
+| Хардкод секретов | Утечка в git | `_FILE` паттерн или Docker Secrets |
+| `math/rand` для крипто | Предсказуемые значения | `crypto/rand` |
+| `InsecureSkipVerify: true` | MITM | Всегда валидировать сертификаты |
+| Секреты в логах | Утечка через логи | Маскировать или не логировать |
+| `ports:` для ML-сервисов | Доступ снаружи | `expose:` + internal network |
+
+---
+
+## 15. Логирование
+
+**slog** — стандартная библиотека, без зависимостей.
+
+| Уровень | Что | Пример |
+|---------|-----|--------|
+| DEBUG | Аудиочанки, gRPC детали | `audio chunk sent, size=3200` |
+| INFO | Команды, интенты, HA действия | `command recognized, intent=turn_on` |
+| WARN | Retry, таймауты, fallback | `stt timeout, using cached` |
+| ERROR | Сбои без остановки | `tts failed, skipping response` |
+
+```go
+// Структурированные поля, не строки
+slog.InfoContext(ctx, "command executed",
+    slog.String("intent_action", "turn_on"),
+    slog.String("area", "bedroom"),
+    slog.Duration("total_latency", elapsed),
+)
+```
+
+---
+
+## 16. Тестирование
+
+### Табличные тесты
+
+```go
+func TestParseIntent(t *testing.T) {
+    tests := []struct {
+        name    string
+        text    string
+        want    Intent
+        wantErr error
+    }{
+        {"turn on light", "включи свет в спальне", Intent{Action: "turn_on", Domain: "light", Area: "bedroom"}, nil},
+        {"unrecognized", "привет как дела", Intent{}, ErrUnrecognized},
+    }
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            got, err := parser.Parse(tt.text)
+            if tt.wantErr != nil {
+                require.ErrorIs(t, err, tt.wantErr)
+                return
+            }
+            require.NoError(t, err)
+            assert.Equal(t, tt.want, got)
+        })
+    }
+}
+```
+
+### Моки через интерфейсы (без mockery)
+
+```go
+type mockTranscriber struct {
+    text string
+    err  error
+}
+
+func (m *mockTranscriber) Transcribe(_ context.Context, _ []byte) (string, error) {
+    return m.text, m.err
+}
+```
+
+### Интеграционные тесты — build tag
+
+```go
+//go:build integration
+
+func TestSTTReal(t *testing.T) {
+    addr := os.Getenv("STT_ADDR")
+    if addr == "" {
+        t.Skip("STT_ADDR not set")
+    }
+}
+```
+
+---
+
+## 17. Proto и buf
+
+```protobuf
+syntax = "proto3";
+package domovoy.stt;
+option go_package = "domovoy/gen/proto/stt";
+
+message TranscribeRequest {
+  bytes audio = 1;      // PCM 16kHz/16bit mono
+  string language = 2;  // ISO 639-1: "ru", "en"
+}
+```
+
+---
+
+## 18. Производительность
+
+### pprof в dev-режиме
+
+```go
+import _ "net/http/pprof"
+
+go func() {
+    if cfg.Debug {
+        http.ListenAndServe(":6060", nil)
+    }
+}()
+```
+
+### Latency budget
+
+| Этап | Цель | Максимум |
+|------|------|---------|
+| Wake word detection | 50мс | 100мс |
+| Audio capture | 2000мс | 3000мс |
+| STT | 5000мс | 8000мс |
+| Intent parsing (regex) | 1мс | 10мс |
+| Intent parsing (LLM) | 2000мс | 5000мс |
+| HA API call | 100мс | 500мс |
+| TTS | 300мс | 1000мс |
+
+---
+
+## 19. Запрещённые паттерны
+
+| Паттерн | Почему нельзя | Вместо этого |
+|---------|---------------|-------------|
+| `init()` | Неявный порядок, скрытые паники | Явная инициализация в `main()` |
+| Глобальные переменные | Неявные зависимости, нельзя тестировать | Зависимости через конструктор |
+| `time.Sleep` в тестах | Flaky тесты | Каналы + `select` + таймаут |
+| `utils/` пакет | Мусорный ящик | Функция в пакете по смыслу |
+| Интерфейс у провайдера | Ненужная связность | Интерфейс у потребителя |
+| Транспортные теги в домене | Протекание слоёв | Отдельные модели на каждом слое |
+
+---
+
+## Чек-лист
+
+1. Усложняй по боли — не внедряй DDD/CQRS пока структура не мешает
+2. Логика живёт рядом с данными — правила в методах доменных моделей
+3. Инкапсуляция — приватные структуры, создание через `New...()`
+4. Каждое изменение затрагивает один слой — если нет, нарушена изоляция
