@@ -15,6 +15,7 @@ export function baseOptions(): BaseLayoutProps {
       {
         type: 'menu',
         text: 'Проекты',
+        on: 'nav',
         items: [
           {
             text: 'Domovoy',
