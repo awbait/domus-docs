@@ -131,25 +131,44 @@ SDK инкапсулирует URL-маршрутизацию, auth-токены
 
 **Трудоёмкость:** Низкая. Добавить endpoint + обновить Widget Picker UI.
 
-### Фаза 4 — Core Services API
+### Фаза 4 — Push-уведомления (Core Services)
 
-**Проблема:** Модули не имеют доступа к сервисам ядра (push, WebSocket, settings).
+**Проблема:** `internal/core/push/` пустой, VAPID ключи в конфиге есть, но модули не могут отправлять push-уведомления.
 
-**Решение:** Набор HTTP-эндпоинтов, доступных модулям:
-- `POST /internal/push` — отправить push-уведомление
-- `POST /internal/ws/broadcast` — отправить WebSocket-сообщение
-- `GET /internal/settings/{key}` — прочитать глобальную настройку
-- `POST /internal/events` — опубликовать событие
+**Решение:** Прямой вызов через Core Services API. Модуль сам решает когда слать push.
 
-Для builtin-модулей — Go-интерфейс `CoreServices`, передаваемый при создании модуля.
+Builtin-модули — Go-интерфейс:
 
-**Трудоёмкость:** Средняя. Проектирование API + реализация для обоих типов модулей.
+```go
+// Передаётся модулю при создании
+type CoreServices interface {
+    SendPush(ctx context.Context, userID string, title, body string) error
+    BroadcastWS(ctx context.Context, event string, payload any) error
+}
+
+// Использование в pill-tracker
+func (s *Service) checkMissedDoses(ctx context.Context) {
+    // ...
+    s.core.SendPush(ctx, ownerID, "Таблетница", "Барсику пора давать Рибоксин")
+}
+```
+
+Dynamic-модули — HTTP:
+
+```
+POST /internal/push
+{"user_id": "...", "title": "Таблетница", "body": "Барсику пора давать Рибоксин"}
+```
+
+`/internal/*` эндпоинты доступны только с localhost (subprocess), не проксируются наружу.
+
+**Трудоёмкость:** Средняя. Реализовать `internal/core/push/` (VAPID, Web Push API) + интерфейс `CoreServices` + HTTP-эндпоинты для dynamic.
 
 ### Фаза 5 — Event Bus
 
-**Проблема:** Модули не могут взаимодействовать между собой.
+**Проблема:** Модули не могут взаимодействовать между собой. pill-tracker не может сообщить domovoy-control о пропущенной дозе без прямой зависимости.
 
-**Решение:** Pub/Sub шина событий в ядре. Модули подписываются на типы событий, ядро маршрутизирует. Для builtin — Go channels, для dynamic — WebSocket или HTTP webhooks.
+**Решение:** Pub/Sub шина событий в ядре. Модули публикуют события, другие модули подписываются. Порядок загрузки не важен — подписчик регистрируется когда загрузился.
 
 ```go
 type Event struct {
@@ -160,7 +179,85 @@ type Event struct {
 }
 ```
 
-**Трудоёмкость:** Средняя. Основной дизайн простой, но нужно продумать гарантии доставки и ordering.
+Builtin-модули:
+
+```go
+// Публикация
+s.core.Publish(core.Event{
+    Type:   "pill-tracker.dose.missed",
+    Source: "pill-tracker",
+    Payload: json.RawMessage(`{"patient":"Барсик","medication":"Рибоксин"}`),
+})
+
+// Подписка (в domovoy-control)
+s.core.Subscribe("pill-tracker.dose.*", func(e core.Event) {
+    // озвучить через Домового
+})
+```
+
+Dynamic-модули — через HTTP:
+
+```
+POST /internal/events/publish
+{"type": "my-module.something.happened", "payload": {...}}
+
+POST /internal/events/subscribe
+{"pattern": "pill-tracker.dose.*", "webhook": "/on-dose-event"}
+```
+
+#### Документация событий в manifest
+
+Каждый модуль описывает свои события — какие публикует и что в payload:
+
+```json
+{
+  "id": "pill-tracker",
+  "events": [
+    {
+      "type": "pill-tracker.dose.missed",
+      "description": "Dose was not given within the scheduled window",
+      "payload": {
+        "patient_name": "string",
+        "medication_name": "string",
+        "scheduled_at": "ISO 8601"
+      }
+    },
+    {
+      "type": "pill-tracker.dose.given",
+      "payload": {
+        "patient_name": "string",
+        "medication_name": "string",
+        "given_by": "string"
+      }
+    }
+  ]
+}
+```
+
+Для builtin — аналогично через `Describer`:
+
+```go
+func (m *Module) Describe() module.Meta {
+    return module.Meta{
+        // ...
+        Events: []module.EventMeta{
+            {
+                Type:        "pill-tracker.dose.missed",
+                Description: "Dose was not given within the scheduled window",
+                Payload: map[string]string{
+                    "patient_name":    "string",
+                    "medication_name": "string",
+                    "scheduled_at":    "ISO 8601",
+                },
+            },
+        },
+    }
+}
+```
+
+Другие модули при подписке знают какие события существуют и что в payload.
+
+**Трудоёмкость:** Средняя. In-memory pub/sub + HTTP endpoints для dynamic + webhook delivery.
 
 ### Шаблонный модуль
 
