@@ -1,3 +1,8 @@
+---
+title: Design System
+description: Дизайн-система Focus Dashboard: цвета, типографика, компоненты
+---
+
 # Focus Dashboard — Design System
 
 > Этот документ описывает дизайн-систему проекта Focus Dashboard.
