@@ -1,3 +1,8 @@
+---
+title: Go Practices
+description: Архитектурные требования и Go best practices для Домового
+---
+
 # Go Practices — Домовой
 
 ---

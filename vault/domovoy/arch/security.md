@@ -1,3 +1,8 @@
+---
+title: Архитектура — Безопасность
+description: Безопасность: mTLS, шифрование, secrets management
+---
+
 # Архитектура — Безопасность
 
 > Обновлять при: реализации mTLS, шифрования логов, secrets management, hub-spoke.
