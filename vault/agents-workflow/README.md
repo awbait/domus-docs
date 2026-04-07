@@ -11,7 +11,6 @@
 - [labels.md](labels.md) — labels для Gitea Issues
 - [agent-contract.md](agent-contract.md) — обязательный контракт поведения для всех агентов
 - [subagent-template.md](subagent-template.md) — шаблон для нового subagent definition
-- [migration-plan.md](migration-plan.md) — план переноса репо в `repos/` и `.worktrees/` (DONE 2026-04-07)
 - [worktree-hooks.md](worktree-hooks.md) — реализация worktree-isolation через кастомные хуки в монорепо без git-корня
 - [bridge-design.md](bridge-design.md) — архитектура Go bridge для webhooks Gitea (планируется, не реализовано)
 
@@ -86,7 +85,7 @@ d:/projects/domus/
 - [x] Архивировать старые scope-агенты (`focus-dashboard.md`, `domus-docs.md`)
 - [x] Обновить корневой `CLAUDE.md`
 - [x] **Миграция структуры:** репо перенесены в `repos/`, legacy в `archive/`
-- [x] Обновить пути в файлах после миграции (см. [migration-plan.md](migration-plan.md))
+- [x] Обновить пути в файлах после миграции структуры в `repos/`
 - [x] Подключить `gitea-mcp` в user scope (`mcp__gitea__*` tools работают, агенты их используют)
 - [x] Создать labels в Gitea (используются на боевых issue, например #112: `priority:p0`, `status:ready`, `type:bug`)
 - [x] Issue templates (`.gitea/issue_template/task.md`, `.gitea/issue_template/bug.md` — PR #113 в focus-dashboard)

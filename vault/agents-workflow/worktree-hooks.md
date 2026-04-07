@@ -7,7 +7,7 @@ Claude Code.
 ## Проблема
 
 Корень `d:/projects/domus/` — **НЕ git-репозиторий**. Это контейнер для пяти
-независимых git-репо в `repos/` (см. [migration-plan.md](migration-plan.md)).
+независимых git-репо в `repos/` (миграция выполнена 2026-04-07).
 
 Встроенная worktree-isolation Claude Code предполагает, что текущий
 проектный каталог сам является git-репо и от его HEAD создаётся worktree.
